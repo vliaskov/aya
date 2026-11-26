@@ -2604,6 +2604,99 @@ mod tests {
         assert_eq!(filtered, expected);
     }
 
+    /// Times name lookups on real kernel BTF: binary search vs the linear scan, on the same data.
+    ///
+    /// ```sh
+    /// cargo test -p aya-obj --release --lib perf_sorted_name_lookup -- --ignored --nocapture
+    /// ```
+    ///
+    /// Reads `/sys/kernel/btf/vmlinux`, or the raw BTF file named by the `AYA_BTF` variable.
+    #[test]
+    #[ignore = "benchmark: needs real kernel BTF and a release build"]
+    fn perf_sorted_name_lookup() {
+        use std::{env, hint::black_box, time::Duration};
+
+        fn timed<T>(f: impl FnOnce() -> T) -> (Duration, T) {
+            let start = std::time::Instant::now();
+            let out = f();
+            (start.elapsed(), out)
+        }
+
+        fn report(what: &str, n: usize, fast: Duration, slow: Duration) {
+            let n = n as u32;
+            println!(
+                "{what}, {n} lookups: binary search {fast:?} ({:?} each), linear {slow:?} \
+                 ({:?} each), {:.0}x faster",
+                fast / n,
+                slow / n,
+                slow.as_secs_f64() / fast.as_secs_f64(),
+            );
+        }
+
+        fn flavorless(name: &str) -> &str {
+            name.split_once("___").map_or(name, |x| x.0)
+        }
+
+        // The core of `find_candidates` in relocation.rs, which is private to that module.
+        fn candidates(btf: &Btf, name: &str, kind: BtfKind) -> Vec<u32> {
+            let name = flavorless(name);
+            btf.types_with_name_prefix(name)
+                .filter(|(_, ty)| ty.kind() == kind)
+                .filter(|(_, ty)| flavorless(&btf.type_name(ty).unwrap()) == name)
+                .map(|(type_id, _)| type_id)
+                .collect()
+        }
+
+        let path = env::var("AYA_BTF").unwrap_or_else(|_| "/sys/kernel/btf/vmlinux".to_owned());
+        let (elapsed, sorted) = timed(|| Btf::parse_file(&path, Endianness::default()).unwrap());
+        println!(
+            "{path}: {} types, parsed in {elapsed:?}",
+            sorted.types.len()
+        );
+
+        let (elapsed, is_sorted) = timed(|| black_box(&sorted).is_sorted_by_name());
+        println!("sorted by name: {is_sorted} (check took {elapsed:?})");
+        if !is_sorted {
+            println!("nothing to compare: only the linear scan applies (kernel older than 7.0?)");
+            return;
+        }
+        let mut linear = sorted.clone();
+        linear.sorted_by_name = false;
+
+        // Every 100th named type, plus some names that don't exist (the scan's worst case).
+        let mut queries: Vec<(String, BtfKind)> = sorted
+            .types()
+            .filter_map(|ty| {
+                let name = sorted.type_name(ty).unwrap();
+                (!name.is_empty()).then(|| (name.into_owned(), ty.kind()))
+            })
+            .step_by(100)
+            .collect();
+        queries.extend((0..10).map(|i| (format!("aya_no_such_type_{i}"), BtfKind::Struct)));
+
+        let exact = |btf: &Btf| -> Vec<Option<u32>> {
+            queries
+                .iter()
+                .map(|(name, kind)| black_box(btf).id_by_type_name_kind(name, *kind).ok())
+                .collect()
+        };
+        let (fast, fast_ids) = timed(|| exact(&sorted));
+        let (slow, slow_ids) = timed(|| exact(&linear));
+        assert_eq!(fast_ids, slow_ids);
+        report("id_by_type_name_kind", queries.len(), fast, slow);
+
+        let core = |btf: &Btf| -> Vec<Vec<u32>> {
+            queries
+                .iter()
+                .map(|(name, kind)| candidates(black_box(btf), name, *kind))
+                .collect()
+        };
+        let (fast, fast_ids) = timed(|| core(&sorted));
+        let (slow, slow_ids) = timed(|| core(&linear));
+        assert_eq!(fast_ids, slow_ids);
+        report("CO-RE candidates", queries.len(), fast, slow);
+    }
+
     #[test]
     #[cfg_attr(miri, ignore = "`open` not available when isolation is enabled")]
     #[cfg_attr(
